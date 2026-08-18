@@ -2,14 +2,14 @@
 #targetengine "HeaderFix"
 
 /*
-HeaderFix v1.0
-Read-only audit for TLDR/, MAINBODY/, MORE/, and REFERENCES/.
+HeaderFix v1.1
+Audit and guarded remediation for TLDR/, MAINBODY/, MORE/, and REFERENCES/.
 Required result: paragraph style H1 with no local overrides.
 ExtendScript / ECMAScript 3 compatible.
 */
 
 (function () {
-    var VERSION = "1.0";
+    var VERSION = "1.1";
     var STYLE_NAME = "H1";
     var HEADERS = ["TLDR/", "MAINBODY/", "MORE/", "REFERENCES/"];
     var rows = [];
@@ -128,6 +128,7 @@ ExtendScript / ECMAScript 3 compatible.
             row.severity = "ERROR";
             row.code = "H1-002";
             row.finding = "Section heading uses paragraph style " + style + "; expected H1.";
+            row.action = "Apply H1";
             counts.wrong++;
         } else if (overrides.value === true) {
             row.severity = "WARNING";
@@ -271,6 +272,12 @@ ExtendScript / ECMAScript 3 compatible.
         button = buttons.add("button", undefined, "Locate");
         button.onClick = locate;
 
+        button = buttons.add("button", undefined, "Fix Selected Error");
+        button.onClick = fixSelectedError;
+
+        button = buttons.add("button", undefined, "Fix All Errors");
+        button.onClick = fixAllErrors;
+
         button = buttons.add("button", undefined, "Save CSV");
         button.onClick = saveCSV;
 
@@ -354,6 +361,164 @@ ExtendScript / ECMAScript 3 compatible.
         } else {
             alert("InDesign could not navigate to this paragraph.\n\n" + row.location);
         }
+    }
+
+    function fixSelectedError() {
+        var row;
+
+        if (ui.list.selection === null) {
+            alert("Select an ERROR row first.");
+            return;
+        }
+
+        row = rows[ui.list.selection.index];
+        if (!isFixableError(row)) {
+            alert("Only H1-002 ERROR rows are eligible for this action.\n\nWarnings and PASS rows are left unchanged.");
+            return;
+        }
+
+        if (!confirm("HeaderFix will apply H1 to this section heading and clear local text attributes on that paragraph.\n\n" +
+                     row.section + "\n" + row.location + "\n\nContinue?")) {
+            return;
+        }
+
+        fixErrorRows([row], "selected error");
+    }
+
+    function fixAllErrors() {
+        var targets = [];
+        var i;
+
+        for (i = 0; i < rows.length; i++) {
+            if (isFixableError(rows[i])) {
+                targets.push(rows[i]);
+            }
+        }
+
+        if (targets.length === 0) {
+            alert("HeaderFix found no H1-002 ERROR rows to fix.");
+            return;
+        }
+
+        if (!confirm("HeaderFix will apply H1 and clear local text attributes on " + targets.length +
+                     " section heading(s) currently reported as H1-002 ERROR.\n\n" +
+                     "PASS and WARNING rows will not be changed.\n\nContinue?")) {
+            return;
+        }
+
+        fixErrorRows(targets, "all errors");
+    }
+
+    function fixErrorRows(targets, label) {
+        var doc = app.activeDocument;
+        var h1 = findParagraphStyle(doc, STYLE_NAME);
+        var fixedCount = 0;
+        var failedCount = 0;
+        var skippedCount = 0;
+        var oldRedraw = null;
+        var i, row, para, currentText, currentStyle, verification;
+
+        if (h1 === null) {
+            alert("HeaderFix could not find exactly one paragraph style named H1 in the active document.\n\nNo changes were made.");
+            return;
+        }
+
+        status("Fixing " + label + "...");
+
+        try {
+            oldRedraw = app.scriptPreferences.enableRedraw;
+            app.scriptPreferences.enableRedraw = false;
+        } catch (eRedraw) {}
+
+        try {
+            for (i = 0; i < targets.length; i++) {
+                row = targets[i];
+                para = row.paragraph;
+
+                if (!valid(para)) {
+                    skippedCount++;
+                    continue;
+                }
+
+                currentText = headerName(cleanText(safeContents(para)));
+                currentStyle = paragraphStyleName(para);
+
+                // Guard against stale UI rows or document edits made after the scan.
+                if (currentText !== row.section || currentStyle === STYLE_NAME) {
+                    skippedCount++;
+                    continue;
+                }
+
+                try {
+                    // Adobe DOM: clearingOverrides=true clears local text attributes
+                    // before applying the canonical paragraph style.
+                    para.applyParagraphStyle(h1, true);
+
+                    verification = overrideState(para);
+                    if (paragraphStyleName(para) === STYLE_NAME && verification.value === false) {
+                        fixedCount++;
+                    } else {
+                        failedCount++;
+                    }
+                } catch (eFix) {
+                    failedCount++;
+                }
+            }
+        } finally {
+            if (oldRedraw !== null) {
+                try {
+                    app.scriptPreferences.enableRedraw = oldRedraw;
+                } catch (eRestore) {}
+            }
+        }
+
+        scan();
+
+        alert("HeaderFix remediation complete.\n\n" +
+              "Corrected: " + fixedCount + "\n" +
+              "Skipped: " + skippedCount + "\n" +
+              "Could not verify: " + failedCount + "\n\n" +
+              "The document was rescanned. Review the current inventory before saving the document.");
+    }
+
+    function isFixableError(row) {
+        return row !== null && row !== undefined &&
+               row.severity === "ERROR" && row.code === "H1-002" &&
+               row.paragraph !== null && valid(row.paragraph);
+    }
+
+    function findParagraphStyle(doc, name) {
+        var styles;
+        var match = null;
+        var matches = 0;
+        var i, style;
+
+        try {
+            styles = doc.allParagraphStyles;
+            for (i = 0; i < styles.length; i++) {
+                style = styles[i];
+                if (valid(style) && String(style.name) === name) {
+                    match = style;
+                    matches++;
+                }
+            }
+        } catch (eAllStyles) {}
+
+        if (matches === 1) {
+            return match;
+        }
+        if (matches > 1) {
+            return null;
+        }
+
+        try {
+            style = doc.paragraphStyles.itemByName(name);
+            if (valid(style)) {
+                return style;
+            }
+        } catch (eTopLevel) {}
+
+        return null;
     }
 
     function saveCSV() {
