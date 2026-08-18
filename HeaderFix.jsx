@@ -1,12 +1,13 @@
 #target "InDesign"
 #targetengine "HeaderFix"
 
-/* HeaderFix v1.2
+/* HeaderFix v1.3
    Canonical section-header paragraph style: Heading 1, with no local overrides.
+   Audits and provides guarded remediation for wrong styles and local overrides.
    ExtendScript / ECMAScript 3 compatible. */
 
 (function () {
-    var VERSION = "1.2";
+    var VERSION = "1.3";
     var STYLE_NAME = "Heading 1";
     var HEADERS = ["TLDR/", "MAINBODY/", "MORE/", "REFERENCES/"];
     var rows = [];
@@ -56,7 +57,7 @@
             }
             sortRows();
             refresh(doc);
-            status("Scan complete. Select a row and click Locate, or double-click it.");
+            status("Scan complete. Select a row and choose Locate or a guarded remediation action.");
         } catch (e1) {
             status("Scan failed: " + e1.message);
             alert("HeaderFix scan failed.\n\n" + e1.message + "\nLine: " + errorLine(e1));
@@ -90,6 +91,7 @@
             row.severity = "WARNING";
             row.code = "H1-003";
             row.finding = STYLE_NAME + " is applied, but local formatting overrides exist.";
+            row.action = "Clear overrides";
             counts.override++;
         } else if (overrides.value === false) {
             counts.pass++;
@@ -97,6 +99,7 @@
             row.severity = "WARNING";
             row.code = "H1-003";
             row.finding = STYLE_NAME + " is applied, but HeaderFix could not verify override state.";
+            row.action = "Locate";
             counts.unknown++;
         }
         return row;
@@ -157,7 +160,7 @@
     }
 
     function buildUI() {
-        var buttons, button;
+        var buttons1, buttons2, button;
         ui.win = new Window("palette", "HeaderFix v" + VERSION);
         ui.win.orientation = "column";
         ui.win.alignChildren = ["fill", "top"];
@@ -168,21 +171,26 @@
         try { ui.title.graphics.font = ScriptUI.newFont(ui.title.graphics.font.name, "BOLD", 15); } catch (e0) {}
 
         ui.summary = ui.win.add("statictext", undefined, "", {multiline:true});
-        ui.summary.preferredSize = [780, 64];
+        ui.summary.preferredSize = [820, 64];
         ui.list = ui.win.add("listbox", undefined, [], {multiselect:false});
-        ui.list.preferredSize = [780, 360];
+        ui.list.preferredSize = [820, 360];
         ui.list.onDoubleClick = locate;
         ui.status = ui.win.add("statictext", undefined, "");
-        ui.status.preferredSize = [780, 32];
+        ui.status.preferredSize = [820, 32];
 
-        buttons = ui.win.add("group");
-        buttons.alignment = ["right", "top"];
-        button = buttons.add("button", undefined, "Rescan"); button.onClick = scan;
-        button = buttons.add("button", undefined, "Locate"); button.onClick = locate;
-        button = buttons.add("button", undefined, "Fix Selected Error"); button.onClick = fixSelectedError;
-        button = buttons.add("button", undefined, "Fix All Errors"); button.onClick = fixAllErrors;
-        button = buttons.add("button", undefined, "Save CSV"); button.onClick = saveCSV;
-        button = buttons.add("button", undefined, "Close"); button.onClick = function () { ui.win.close(); };
+        buttons1 = ui.win.add("group");
+        buttons1.alignment = ["right", "top"];
+        button = buttons1.add("button", undefined, "Rescan"); button.onClick = scan;
+        button = buttons1.add("button", undefined, "Locate"); button.onClick = locate;
+        button = buttons1.add("button", undefined, "Fix Selected Error"); button.onClick = fixSelectedError;
+        button = buttons1.add("button", undefined, "Fix All Errors"); button.onClick = fixAllErrors;
+
+        buttons2 = ui.win.add("group");
+        buttons2.alignment = ["right", "top"];
+        button = buttons2.add("button", undefined, "Clear Selected Override"); button.onClick = clearSelectedOverride;
+        button = buttons2.add("button", undefined, "Clear All Overrides"); button.onClick = clearAllOverrides;
+        button = buttons2.add("button", undefined, "Save CSV"); button.onClick = saveCSV;
+        button = buttons2.add("button", undefined, "Close"); button.onClick = function () { ui.win.close(); };
     }
 
     function refresh(doc) {
@@ -228,7 +236,7 @@
         if (ui.list.selection === null) { alert("Select an ERROR row first."); return; }
         row = rows[ui.list.selection.index];
         if (!isFixableError(row)) {
-            alert("Only H1-002 ERROR rows are eligible for this action.\n\nWarnings and PASS rows are left unchanged.");
+            alert("Only H1-002 ERROR rows are eligible for this action.\n\nWARNING and PASS rows are left unchanged.");
             return;
         }
         if (!confirm("HeaderFix will apply " + STYLE_NAME + " to this section heading and clear local text attributes on that paragraph.\n\n" +
@@ -281,9 +289,87 @@
               "\n\nThe document was rescanned. Review the current inventory before saving the document.");
     }
 
+    function clearSelectedOverride() {
+        var row;
+        if (ui.list.selection === null) { alert("Select an H1-003 WARNING row first."); return; }
+        row = rows[ui.list.selection.index];
+        if (!isFixableWarning(row)) {
+            alert("Only verified H1-003 WARNING rows are eligible for this action.\n\nThe row must still use " + STYLE_NAME + " and have a verified local override.");
+            return;
+        }
+        if (!confirm("HeaderFix will clear local formatting overrides from this " + STYLE_NAME + " section heading.\n\n" +
+                     row.section + "\n" + row.location + "\n\nContinue?")) { return; }
+        clearOverrideRows([row], "selected override");
+    }
+
+    function clearAllOverrides() {
+        var targets = [], i;
+        for (i = 0; i < rows.length; i++) { if (isFixableWarning(rows[i])) { targets.push(rows[i]); } }
+        if (targets.length === 0) { alert("HeaderFix found no verified H1-003 override warnings to clear."); return; }
+        if (!confirm("HeaderFix will clear local formatting overrides from " + targets.length +
+                     " section heading(s) currently reported as H1-003 WARNING.\n\n" +
+                     "Only verified " + STYLE_NAME + " override rows will be changed. PASS and ERROR rows will not be changed.\n\nContinue?")) { return; }
+        clearOverrideRows(targets, "all overrides");
+    }
+
+    function clearOverrideRows(targets, label) {
+        var doc = app.activeDocument;
+        var canonicalStyle = findParagraphStyle(doc, STYLE_NAME);
+        var fixedCount = 0, failedCount = 0, skippedCount = 0, oldRedraw = null;
+        var i, row, para, currentText, currentStyle, currentOverride, verification;
+
+        if (canonicalStyle === null) {
+            alert("HeaderFix could not find exactly one paragraph style named " + STYLE_NAME + " in the active document.\n\nNo changes were made.");
+            return;
+        }
+
+        status("Clearing " + label + "...");
+        try { oldRedraw = app.scriptPreferences.enableRedraw; app.scriptPreferences.enableRedraw = false; } catch (e0) {}
+        try {
+            for (i = 0; i < targets.length; i++) {
+                row = targets[i];
+                para = row.paragraph;
+                if (!valid(para)) { skippedCount++; continue; }
+
+                currentText = headerName(cleanText(safeContents(para)));
+                currentStyle = paragraphStyleName(para);
+                currentOverride = overrideState(para);
+
+                // Guard against stale UI rows, manual edits, or an override already cleared.
+                if (currentText !== row.section || currentStyle !== STYLE_NAME || currentOverride.value !== true) {
+                    skippedCount++;
+                    continue;
+                }
+
+                try {
+                    // Reapply the canonical paragraph style while clearing local text attributes.
+                    // This is appropriate for these four exact marker paragraphs, whose canonical
+                    // state is Heading 1 with no manual/local formatting.
+                    para.applyParagraphStyle(canonicalStyle, true);
+                    verification = overrideState(para);
+                    if (paragraphStyleName(para) === STYLE_NAME && verification.value === false) { fixedCount++; }
+                    else { failedCount++; }
+                } catch (e1) { failedCount++; }
+            }
+        } finally {
+            if (oldRedraw !== null) { try { app.scriptPreferences.enableRedraw = oldRedraw; } catch (e2) {} }
+        }
+
+        scan();
+        alert("HeaderFix override remediation complete.\n\nCleared: " + fixedCount +
+              "\nSkipped: " + skippedCount + "\nCould not verify: " + failedCount +
+              "\n\nThe document was rescanned. Review the current inventory before saving the document.");
+    }
+
     function isFixableError(row) {
         return row !== null && row !== undefined && row.severity === "ERROR" &&
                row.code === "H1-002" && row.paragraph !== null && valid(row.paragraph);
+    }
+
+    function isFixableWarning(row) {
+        return row !== null && row !== undefined && row.severity === "WARNING" &&
+               row.code === "H1-003" && row.style === STYLE_NAME && row.overrides === true &&
+               row.paragraph !== null && valid(row.paragraph);
     }
 
     function findParagraphStyle(doc, name) {
